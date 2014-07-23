@@ -1,5 +1,5 @@
-# For more information on configuring mediaproxy-ng see
-# http://github.com/sipwise/mediproxy-ng
+# For more information on configuring ngcp-rtpengine see
+# http://github.com/sipwise/rtpengine
 #
 # (m) means the item is mandatory, (o) means the item is optional
 #

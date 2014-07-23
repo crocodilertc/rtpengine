@@ -1,37 +1,37 @@
 #!/bin/bash
 #
-# mediaproxy-ng		Startup script for NGCP mediaproxy-ng
+# rtpengine		Startup script for NGCP rtpengine
 #
 # chkconfig: 345 84 16
-# description: NGCP mediaproxy-ng
+# description: NGCP rtpengine
 #
-# processname: mediaproxy-ng
-# config: /etc/sysconfig/mediaproxy-ng
-# pidfile: /var/run/mediaproxy-ng.pid
+# processname: rtpengine
+# config: /etc/sysconfig/rtpengine
+# pidfile: /var/run/rtpengine.pid
 #
 ### BEGIN INIT INFO
-# Provides: mediaproxy-ng
+# Provides: rtpengine
 # Required-Start: $local_fs $network
-# Short-Description: NGCP mediaproxy-ng
-# Description: NGCP mediaproxy-ng 
+# Short-Description: NGCP rtpengine
+# Description: NGCP rtpengine
 ### END INIT INFO
 
 # Source function library.
 . /etc/rc.d/init.d/functions
 
-if [ -f /etc/sysconfig/mediaproxy-ng ]
+if [ -f /etc/sysconfig/rtpengine ]
 then
-        . /etc/sysconfig/mediaproxy-ng
+        . /etc/sysconfig/rtpengine
 else
-	echo "Error: /etc/sysconfig/mediproxy-ng not present"
+	echo "Error: /etc/sysconfig/rtpengine not present"
 	exit -1
 fi
 
-mediaproxy_ng=/usr/sbin/mediaproxy-ng
-prog=mediaproxy-ng
-pidfile=${PIDFILE-/var/run/mediaproxy-ng.pid}
-lockfile=${LOCKFILE-/var/lock/subsys/mediaproxy-ng}
-cachefile=/var/lib/mediaproxy-ng/mediaproxy-ng.cfg
+mediaproxy_ng=/usr/sbin/rtpengine
+prog=rtpengine
+pidfile=${PIDFILE-/var/run/rtpengine.pid}
+lockfile=${LOCKFILE-/var/lock/subsys/rtpengine}
+cachefile=/var/lib/rtpengine/rtpengine.cfg
 RETVAL=0
 
 OPTS="--pidfile $pidfile"
@@ -40,7 +40,7 @@ IP6=0
 
 build_opts() {
 	shopt -s nocasematch
-	RPMS=`rpm -qa | grep ngcp-mediaproxy-ng-kernel`
+	RPMS=`rpm -qa | grep ngcp-rtpengine-kernel`
 	if [[ "$KERNEL" == "yes" && -n "$TABLE" && -n "$RPMS" ]]
 	then
 		MODULE=1

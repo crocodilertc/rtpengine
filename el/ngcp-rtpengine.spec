@@ -1,12 +1,12 @@
-Name:		ngcp-mediaproxy-ng
-Version:	2.3.6
+Name:		ngcp-rtpengine
+Version:	3.3.0
 Release:	0%{?dist}
-Summary:	The Sipwise NGCP mediaproxy-ng
+Summary:	The Sipwise NGCP rtpengine
 
 Group:		System Environment/Daemons
 License:	GPLv3
-URL:		https://github.com/sipwise/mediaproxy-ng
-Source0:	https://github.com/sipwise/mediaproxy-ng/archive/%{version}/%{name}-%{version}.tar.gz
+URL:		https://github.com/sipwise/rtpengine
+Source0:	https://github.com/sipwise/rtpengine/archive/%{version}/%{name}-%{version}.tar.gz
 Conflicts:	%{name}-kernel < %{version}
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
@@ -17,24 +17,24 @@ Requires:	glibc libcurl openssl pcre xmlrpc-c
 
 
 %description
-The Sipwise NGCP mediaproxy-ng is a proxy for RTP traffic and other UDP based
+The Sipwise NGCP rtpengine is a proxy for RTP traffic and other UDP based
 media traffic. It's meant to be used with the Kamailio SIP proxy and forms a
 drop-in replacement for any of the other available RTP and media proxies.
 
 
 %package kernel
-Summary:	NGCP mediaproxy-ng in-kernel packet forwarding
+Summary:	NGCP rtpengine in-kernel packet forwarding
 Group:		System Environment/Daemons
 BuildRequires:	gcc make redhat-rpm-config iptables-devel
-Requires:	iptables iptables-ipv6 ngcp-mediaproxy-ng = %{version}
-Requires:	ngcp-mediaproxy-ng-dkms = %{version}
+Requires:	iptables iptables-ipv6 ngcp-rtpengine = %{version}
+Requires:	ngcp-rtpengine-dkms = %{version}
 
 %description kernel
-NGCP mediaproxy-ng in-kernel packet forwarding
+NGCP rtpengine in-kernel packet forwarding
 
 
 %package dkms
-Summary:	Kernel module for NGCP mediaproxy-ng in-kernel packet forwarding
+Summary:	Kernel module for NGCP rtpengine in-kernel packet forwarding
 Group:		System Environment/Daemons
 BuildArch:	noarch
 BuildRequires:	redhat-rpm-config
@@ -43,7 +43,7 @@ Requires(post):	epel-release dkms
 Requires(preun): epel-release dkms
 
 %description dkms
-Kernel module for mediaproxy-ng in-kernel packet forwarding
+Kernel module for rtpengine in-kernel packet forwarding
 
 
 %prep
@@ -60,14 +60,14 @@ cd ..
 
 %install
 # Install the userspace daemon
-install -D -p -m755 daemon/mediaproxy-ng %{buildroot}/%{_sbindir}/mediaproxy-ng
+install -D -p -m755 daemon/rtpengine %{buildroot}/%{_sbindir}/rtpengine
 
 ## Install the init.d script and configuration file
-install -D -p -m755 el/mediaproxy-ng.init \
-	%{buildroot}/%{_sysconfdir}/rc.d/init.d/mediaproxy-ng
-install -D -p -m644 el/mediaproxy-ng.sysconfig \
-	%{buildroot}/%{_sysconfdir}/sysconfig/mediaproxy-ng
-mkdir -p %{buildroot}/%{_sharedstatedir}/mediaproxy-ng
+install -D -p -m755 el/ngcp-rtpengine.init \
+	%{buildroot}/%{_sysconfdir}/rc.d/init.d/rtpengine
+install -D -p -m644 el/ngcp-rtpengine.sysconfig \
+	%{buildroot}/%{_sysconfdir}/sysconfig/rtpengine
+mkdir -p %{buildroot}/%{_sharedstatedir}/rtpengine
 
 # Install the iptables plugin
 install -D -p -m755 iptables-extension/libxt_MEDIAPROXY.so \
@@ -89,9 +89,9 @@ rm -rf %{buildroot}
 
 
 %pre
-/usr/sbin/groupadd -r mediaproxy-ng 2> /dev/null || :
-/usr/sbin/useradd -r -g mediaproxy-ng -s /sbin/nologin -c "mediaproxy-ng daemon" \
-	-d %{_sharedstatedir}/mediaproxy-ng mediaproxy-ng \
+/usr/sbin/groupadd -r rtpengine 2> /dev/null || :
+/usr/sbin/useradd -r -g rtpengine -s /sbin/nologin -c "rtpengine daemon" \
+	-d %{_sharedstatedir}/rtpengine rtpengine \
 	2> /dev/null || :
 
 
@@ -124,12 +124,12 @@ true
 
 %files
 # Userspace daemon
-%{_sbindir}/mediaproxy-ng
+%{_sbindir}/rtpengine
 
 # init.d script and configuration file
-%{_sysconfdir}/rc.d/init.d/mediaproxy-ng
-%config(noreplace) %{_sysconfdir}/sysconfig/mediaproxy-ng
-%dir %{_sharedstatedir}/mediaproxy-ng
+%{_sysconfdir}/rc.d/init.d/rtpengine
+%config(noreplace) %{_sysconfdir}/sysconfig/rtpengine
+%dir %{_sharedstatedir}/rtpengine
 
 # Documentation
 %doc LICENSE README.md el/README.el.md debian/changelog debian/copyright
@@ -144,6 +144,9 @@ true
 
 
 %changelog
+* Thu May 15 2014 Hugh Waite <hugh.waite@acision.com>
+  - Rename to rtpengine
+  - Updated version to 3.3.0
 * Mon Nov 11 2013 Peter Dunkley <peter.dunkley@crocodilertc.net>
   - Updated version to 2.3.2
   - Set license to GPLv3
