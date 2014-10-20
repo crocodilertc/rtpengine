@@ -186,10 +186,6 @@ struct sdp_attribute {
 
 
 static const char ice_chars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-static char ice_foundation[17];
-static str ice_foundation_str;
-static char ice_foundation_alt[17];
-static str ice_foundation_str_alt;
 
 
 
@@ -302,11 +298,16 @@ INLINE int extract_token(char **sp, char *end, str *out) {
 	
 }
 #define EXTRACT_TOKEN(field) if (extract_token(&start, end, &output->field)) return -1
-#define EXTRACT_NETWORK_ADDRESS(field) \
-	EXTRACT_TOKEN(field.network_type); \
-	EXTRACT_TOKEN(field.address_type); \
-	EXTRACT_TOKEN(field.address); \
-	if (parse_address(&output->field)) return -1
+#define EXTRACT_NETWORK_ADDRESS_NP(field)			\
+		EXTRACT_TOKEN(field.network_type);		\
+		EXTRACT_TOKEN(field.address_type);		\
+		EXTRACT_TOKEN(field.address)
+#define EXTRACT_NETWORK_ADDRESS(field)				\
+		EXTRACT_NETWORK_ADDRESS_NP(field);		\
+		if (parse_address(&output->field)) return -1
+#define EXTRACT_NETWORK_ADDRESS_NF(field)			\
+		EXTRACT_NETWORK_ADDRESS_NP(field);		\
+		if (parse_address(&output->field)) output->field.parsed.s6_addr32[0] = 0xfe
 
 static int parse_origin(char *start, char *end, struct sdp_origin *output) {
 	if (output->parsed)
@@ -315,7 +316,7 @@ static int parse_origin(char *start, char *end, struct sdp_origin *output) {
 	EXTRACT_TOKEN(username);
 	EXTRACT_TOKEN(session_id);
 	EXTRACT_TOKEN(version);
-	EXTRACT_NETWORK_ADDRESS(address);
+	EXTRACT_NETWORK_ADDRESS_NF(address);
 
 	output->parsed = 1;
 	return 0;
@@ -984,7 +985,7 @@ int sdp_streams(const GQueue *sessions, GQueue *streams, struct sdp_ng_flags *fl
 			sp->consecutive_ports = media->port_count;
 			sp->protocol = transport_protocol(&media->transport);
 			sp->type = media->media_type;
-			memcpy(sp->direction, flags->directions, sizeof(sp->direction));
+			memcpy(sp->direction, flags->direction, sizeof(sp->direction));
 			sp->desired_family = flags->address_family;
 			bf_xset(&sp->sp_flags, SP_FLAG_ASYMMETRIC, flags->asymmetric);
 			bf_xset(&sp->sp_flags, SP_FLAG_STRICT_SOURCE, flags->strict_source);
@@ -1230,22 +1231,11 @@ warn:
 	return 0;
 }
 
-static int insert_ice_address(struct sdp_chopper *chop, struct packet_stream *ps) {
+static int insert_ice_address(struct sdp_chopper *chop, struct packet_stream *ps, struct interface_address *ifa) {
 	char buf[64];
 	int len;
 
-	call_stream_address(buf, ps, SAF_ICE, &len);
-	chopper_append_dup(chop, buf, len);
-	chopper_append_printf(chop, " %hu", ps->sfd->fd.localport);
-
-	return 0;
-}
-
-static int insert_ice_address_alt(struct sdp_chopper *chop, struct packet_stream *ps) {
-	char buf[64];
-	int len;
-
-	call_stream_address_alt(buf, ps, SAF_ICE, &len);
+	call_stream_address46(buf, ps, SAF_ICE, &len, ifa);
 	chopper_append_dup(chop, buf, len);
 	chopper_append_printf(chop, " %hu", ps->sfd->fd.localport);
 
@@ -1503,53 +1493,40 @@ static void insert_candidates(struct sdp_chopper *chop, struct packet_stream *rt
 			      unsigned long priority, struct sdp_media *media,
 			      unsigned int relay)
 {
-	chopper_append_c(chop, "a=candidate:");
-	chopper_append_str(chop, &ice_foundation_str);
-	chopper_append_printf(chop, " 1 UDP %lu ", priority);
-	insert_ice_address(chop, rtp);
-	if (relay)
-	    chopper_append_c(chop, " typ relay\r\n");
-	else
-	    chopper_append_c(chop, " typ host\r\n");
+	GQueue addrs = G_QUEUE_INIT;
+	GList *l;
+	struct interface_address *ifa;
 
-	if (rtcp) {
-		/* rtcp-mux only possible in answer */
+	get_all_interface_addresses(&addrs, rtp->media->interface, rtp->media->desired_family);
+
+	for (l = addrs.head; l; l = l->next) {
+		ifa = l->data;
+
 		chopper_append_c(chop, "a=candidate:");
-		chopper_append_str(chop, &ice_foundation_str);
-		chopper_append_printf(chop, " 2 UDP %lu ", priority - 1);
-		insert_ice_address(chop, rtcp);
+		chopper_append_str(chop, &ifa->ice_foundation);
+		chopper_append_printf(chop, " 1 UDP %lu ", priority);
+		insert_ice_address(chop, rtp, ifa);
 		if (relay)
 		    chopper_append_c(chop, " typ relay\r\n");
 		else
 		    chopper_append_c(chop, " typ host\r\n");
+
+		if (rtcp) {
+			/* rtcp-mux only possible in answer */
+			chopper_append_c(chop, "a=candidate:");
+			chopper_append_str(chop, &ifa->ice_foundation);
+			chopper_append_printf(chop, " 2 UDP %lu ", priority - 1);
+			insert_ice_address(chop, rtcp, ifa);
+			if (relay)
+			    chopper_append_c(chop, " typ relay\r\n");
+			else
+			    chopper_append_c(chop, " typ host\r\n");
+		}
+
+		priority -= 256;
 	}
 
-}
-
-static void insert_candidates_alt(struct sdp_chopper *chop, struct packet_stream *rtp, struct packet_stream *rtcp,
-				  unsigned long priority, struct sdp_media *media,
-				  unsigned int relay)
-{
-	chopper_append_c(chop, "a=candidate:");
-	chopper_append_str(chop, &ice_foundation_str_alt);
-	chopper_append_printf(chop, " 1 UDP %lu ", priority);
-	insert_ice_address_alt(chop, rtp);
-	if (relay)
-	    chopper_append_c(chop, " typ relay\r\n");
-	else
-	    chopper_append_c(chop, " typ host\r\n");
-
-	if (rtcp) {
-		chopper_append_c(chop, "a=candidate:");
-		chopper_append_str(chop, &ice_foundation_str_alt);
-		chopper_append_printf(chop, " 2 UDP %lu ", priority - 1);
-		insert_ice_address_alt(chop, rtcp);
-		if (relay)
-		    chopper_append_c(chop, " typ relay\r\n");
-		else
-		    chopper_append_c(chop, " typ host\r\n");
-	}
-
+	g_queue_clear(&addrs);
 }
 
 static int has_ice(GQueue *sessions) {
@@ -1809,13 +1786,6 @@ int sdp_replace(struct sdp_chopper *chop, GQueue *sessions, struct call_monologu
 
 				insert_candidates(chop, ps, ps_rtcp,
 						  priority, sdp_media, flags->ice_force_relay);
-
-				if (callmaster_has_ipv6(call->callmaster)) {
-					priority -= 256;
-					insert_candidates_alt(chop, ps, ps_rtcp,
-							      priority, sdp_media,
-							      flags->ice_force_relay);
-				}
 			}
 
 next:
@@ -1833,11 +1803,9 @@ error:
 }
 
 void sdp_init() {
-	random_ice_string(ice_foundation, sizeof(ice_foundation) - 1);
-	ice_foundation_str.s = ice_foundation;
-	ice_foundation_str.len = sizeof(ice_foundation) - 1;
+}
 
-	random_ice_string(ice_foundation_alt, sizeof(ice_foundation_alt) - 1);
-	ice_foundation_str_alt.s = ice_foundation_alt;
-	ice_foundation_str_alt.len = sizeof(ice_foundation_alt) - 1;
+void sdp_ice_foundation(struct interface_address *ifa) {
+	random_ice_string(ifa->foundation_buf, sizeof(ifa->foundation_buf));
+	str_init_len(&ifa->ice_foundation, ifa->foundation_buf, sizeof(ifa->foundation_buf));
 }

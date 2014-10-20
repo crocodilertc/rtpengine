@@ -39,7 +39,7 @@ static str *streams_print(GQueue *s, int start, int end, const char *prefix, enu
 	if (prefix)
 		g_string_append_printf(o, "%s ", prefix);
 
-	for (i = start; i < end; i++) {
+	for (i = start; i <= end; i++) {
 		for (l = s->head; l; l = l->next) {
 			media = l->data;
 			if (media->index == i)
@@ -81,6 +81,11 @@ static int addr_parse_udp(struct stream_params *sp, char **out) {
 	int i;
 
 	ZERO(*sp);
+
+	SP_SET(sp, SEND);
+	SP_SET(sp, RECV);
+	sp->protocol = &transport_protocols[PROTO_RTP_AVP];
+
 	if (out[RE_UDP_UL_ADDR4] && *out[RE_UDP_UL_ADDR4]) {
 		ip4 = inet_addr(out[RE_UDP_UL_ADDR4]);
 		if (ip4 == -1)
@@ -103,9 +108,9 @@ static int addr_parse_udp(struct stream_params *sp, char **out) {
 		for (cp =out[RE_UDP_UL_FLAGS]; *cp && i < 2; cp++) {
 			c = chrtoupper(*cp);
 			if (c == 'E')
-				sp->direction[i++] = DIR_EXTERNAL;
+				str_init(&sp->direction[i++], "external");
 			else if (c == 'I')
-				sp->direction[i++] = DIR_INTERNAL;
+				str_init(&sp->direction[i++], "internal");
 		}
 	}
 
@@ -114,6 +119,9 @@ static int addr_parse_udp(struct stream_params *sp, char **out) {
 	if (!sp->index)
 		sp->index = 1;
 	sp->consecutive_ports = 1;
+
+	sp->rtcp_endpoint = sp->rtp_endpoint;
+	sp->rtcp_endpoint.port++;
 
 	return 0;
 fail:
@@ -126,6 +134,7 @@ static str *call_update_lookup_udp(char **out, struct callmaster *m, enum call_o
 	GQueue q = G_QUEUE_INIT;
 	struct stream_params sp;
 	str *ret, callid, viabranch, fromtag, totag = STR_NULL;
+	int i;
 
 	str_init(&callid, out[RE_UDP_UL_CALLID]);
 	str_init(&viabranch, out[RE_UDP_UL_VIABRANCH]);
@@ -137,7 +146,7 @@ static str *call_update_lookup_udp(char **out, struct callmaster *m, enum call_o
 	if (!c) {
 		ilog(LOG_WARNING, "["STR_FORMAT"] Got UDP LOOKUP for unknown call-id",
 			STR_FMT(&callid));
-		return str_sprintf("%s 0 " IPF "\n", out[RE_UDP_COOKIE], IPP(m->conf.ipv4));
+		return str_sprintf("%s 0 0.0.0.0\n", out[RE_UDP_COOKIE]);
 	}
 	monologue = call_get_mono_dialogue(c, &fromtag, &totag);
 	if (!monologue)
@@ -147,11 +156,14 @@ static str *call_update_lookup_udp(char **out, struct callmaster *m, enum call_o
 		goto addr_fail;
 
 	g_queue_push_tail(&q, &sp);
-	/* XXX return value */
-	monologue_offer_answer(monologue, &q, NULL);
+	i = monologue_offer_answer(monologue, &q, NULL);
 	g_queue_clear(&q);
 
-	ret = streams_print(&monologue->medias, sp.index, sp.index, out[RE_UDP_COOKIE], SAF_UDP);
+	if (i)
+		goto unlock_fail;
+
+	ret = streams_print(&monologue->active_dialogue->medias,
+			sp.index, sp.index, out[RE_UDP_COOKIE], SAF_UDP);
 	rwlock_unlock_w(&c->master_lock);
 
 	redis_update(c, m->conf.redis);
@@ -160,16 +172,16 @@ static str *call_update_lookup_udp(char **out, struct callmaster *m, enum call_o
 	goto out;
 
 ml_fail:
-	rwlock_unlock_w(&c->master_lock);
-	ilog(LOG_WARNING, "Invalid dialogue association");
-	goto fail_out;
+	ilog(LOG_ERR, "Invalid dialogue association");
+	goto unlock_fail;
 
 addr_fail:
-	rwlock_unlock_w(&c->master_lock);
-	ilog(LOG_WARNING, "Failed to parse a media stream: %s/%s:%s", out[RE_UDP_UL_ADDR4], out[RE_UDP_UL_ADDR6], out[RE_UDP_UL_PORT]);
-	goto fail_out;
+	ilog(LOG_ERR, "Failed to parse a media stream: %s/%s:%s",
+			out[RE_UDP_UL_ADDR4], out[RE_UDP_UL_ADDR6], out[RE_UDP_UL_PORT]);
+	goto unlock_fail;
 
-fail_out:
+unlock_fail:
+	rwlock_unlock_w(&c->master_lock);
 	ret = str_sprintf("%s E8\n", out[RE_UDP_COOKIE]);
 out:
 	obj_put(c);
@@ -204,6 +216,10 @@ static int streams_parse_func(char **a, void **ret, void *p) {
 
 	i = p;
 	sp = g_slice_alloc0(sizeof(*sp));
+
+	SP_SET(sp, SEND);
+	SP_SET(sp, RECV);
+	sp->protocol = &transport_protocols[PROTO_RTP_AVP];
 
 	ip = inet_addr(a[0]);
 	if (ip == -1)
@@ -283,10 +299,10 @@ static str *call_request_lookup_tcp(char **out, struct callmaster *m, enum call_
 		ilog(LOG_WARNING, "Invalid dialogue association");
 		goto out2;
 	}
-	/* XXX return value */
-	monologue_offer_answer(monologue, &s, NULL);
+	if (monologue_offer_answer(monologue, &s, NULL))
+		goto out2;
 
-	ret = streams_print(&monologue->medias, 1, s.length, NULL, SAF_TCP);
+	ret = streams_print(&monologue->active_dialogue->medias, 1, s.length, NULL, SAF_TCP);
 
 out2:
 	rwlock_unlock_w(&c->master_lock);
@@ -489,15 +505,8 @@ static void call_ng_process_flags(struct sdp_ng_flags *out, bencode_item_t *inpu
 
 	diridx = 0;
 	if ((list = bencode_dictionary_get_expect(input, "direction", BENCODE_LIST))) {
-		for (it = list->child; it && diridx < 2; it = it->sibling) {
-			if (!bencode_strcmp(it, "internal"))
-				out->directions[diridx++] = DIR_INTERNAL;
-			else if (!bencode_strcmp(it, "external"))
-				out->directions[diridx++] = DIR_EXTERNAL;
-			else
-				ilog(LOG_WARN, "Unknown 'direction' flag encountered: '"BENCODE_FORMAT"'",
-						BENCODE_FMT(it));
-		}
+		for (it = list->child; it && diridx < 2; it = it->sibling)
+			bencode_get_str(it, &out->direction[diridx++]);
 	}
 
 	list = bencode_dictionary_get_expect(input, "received from", BENCODE_LIST);
@@ -513,7 +522,7 @@ static void call_ng_process_flags(struct sdp_ng_flags *out, bencode_item_t *inpu
 			out->ice_remove = 1;
 		else if (!str_cmp(&s, "force"))
 			out->ice_force = 1;
-		else if (!str_cmp(&s, "force_relay"))
+		else if (!str_cmp(&s, "force_relay") || !str_cmp(&s, "force-relay"))
 			out->ice_force_relay = 1;
 		else
 			ilog(LOG_WARN, "Unknown 'ICE' flag encountered: '"STR_FORMAT"'",
@@ -598,9 +607,9 @@ static const char *call_offer_answer_ng(bencode_item_t *input, struct callmaster
 
 	chopper = sdp_chopper_new(&sdp);
 	bencode_buffer_destroy_add(output->buffer, (free_func_t) sdp_chopper_destroy, chopper);
-	/* XXX return value */
-	monologue_offer_answer(monologue, &streams, &flags);
-	ret = sdp_replace(chopper, &parsed, monologue, &flags);
+	ret = monologue_offer_answer(monologue, &streams, &flags);
+	if (!ret)
+		ret = sdp_replace(chopper, &parsed, monologue->active_dialogue, &flags);
 
 	rwlock_unlock_w(&call->master_lock);
 	redis_update(call, m->conf.redis);
@@ -823,7 +832,7 @@ void ng_call_stats(struct call *call, const str *fromtag, const str *totag, benc
 stats:
 	match_tag = (totag && totag->s && totag->len) ? totag : fromtag;
 
-	if (!match_tag) {
+	if (!match_tag || !match_tag->len) {
 		for (l = call->monologues; l; l = l->next) {
 			ml = l->data;
 			ng_stats_monologue(tags, ml, totals);
@@ -845,6 +854,22 @@ stats:
 	ng_stats(bencode_dictionary_add_dictionary(dict, "RTCP"), &totals->totals[1], NULL);
 }
 
+void ng_list_calls( struct callmaster *m, bencode_item_t *output, long long int limit) {
+	GHashTableIter iter;
+	gpointer key, value;
+
+	rwlock_lock_r(&m->hashlock);
+
+	g_hash_table_iter_init (&iter, m->callhash);
+	while (limit-- && g_hash_table_iter_next (&iter, &key, &value)) {
+		bencode_list_add_str_dup(output, key);
+	}
+
+	rwlock_unlock_r(&m->hashlock);
+}
+
+
+
 const char *call_query_ng(bencode_item_t *input, struct callmaster *m, bencode_item_t *output) {
 	str callid, fromtag, totag;
 	struct call *call;
@@ -861,6 +886,24 @@ const char *call_query_ng(bencode_item_t *input, struct callmaster *m, bencode_i
 	ng_call_stats(call, &fromtag, &totag, output, NULL);
 	rwlock_unlock_w(&call->master_lock);
 	obj_put(call);
+
+	return NULL;
+}
+
+
+const char *call_list_ng(bencode_item_t *input, struct callmaster *m, bencode_item_t *output) {
+	bencode_item_t *calls = NULL;
+	long long int limit;
+
+	limit = bencode_dictionary_get_integer(input, "limit", 32);
+
+	if (limit < 0) {
+		return "invalid limit, must be >= 0";
+	}
+	bencode_dictionary_add_string(output, "result", "ok");
+	calls = bencode_dictionary_add_list(output, "calls");
+
+	ng_list_calls(m, calls, limit);
 
 	return NULL;
 }

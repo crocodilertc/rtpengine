@@ -16,7 +16,7 @@ struct sdp_ng_flags {
 	const struct transport_protocol *transport_protocol;
 	struct in6_addr parsed_received_from;
 	struct in6_addr parsed_media_address;
-	enum stream_direction directions[2];
+	str direction[2];
 	int address_family;
 	int tos;
 	int asymmetric:1,
@@ -44,6 +44,7 @@ struct sdp_chopper {
 };
 
 void sdp_init(void);
+void sdp_ice_foundation(struct interface_address *ifa);
 
 int sdp_parse(str *body, GQueue *sessions);
 int sdp_streams(const GQueue *sessions, GQueue *streams, struct sdp_ng_flags *);

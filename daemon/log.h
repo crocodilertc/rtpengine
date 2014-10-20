@@ -20,8 +20,21 @@ struct log_info {
 	} e;
 };
 
+extern gboolean _log_stderr;
+extern int _log_facility;
 
 
+typedef struct _fac_code {
+	char	*c_name;
+	int	c_val;
+} _fac_code_t;
+
+extern const _fac_code_t _facilitynames[];
+
+typedef void (* write_log_t) (int facility_priority, char *format, ...) __attribute__ ((format (printf, 2, 3)));
+extern write_log_t write_log;
+
+void log_to_stderr(int facility_priority, char *format, ...) __attribute__ ((format (printf, 2, 3)));
 
 extern struct log_info __thread log_info;
 extern volatile gint log_level;
@@ -29,6 +42,7 @@ extern volatile gint log_level;
 
 
 
+void log_init(void);
 void ilog(int prio, const char *fmt, ...)__attribute__ ((format (printf, 2, 3)));
 
 
@@ -79,6 +93,7 @@ INLINE void log_info_stream_fd(struct stream_fd *sfd) {
 #define LOG_LEVEL_MASK(v)	((v) & 0x0f)
 
 #define LOG_FLAG_RESTORE	0x10
+#define LOG_FLAG_LIMIT		0x20
 
 
 

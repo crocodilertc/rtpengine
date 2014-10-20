@@ -34,15 +34,33 @@
 
 
 
+#ifndef DELETE_DELAY
+#define DELETE_DELAY 30
+#endif
+
+#ifndef PORT_RANDOM_MIN
+#define PORT_RANDOM_MIN 6
+#define PORT_RANDOM_MAX 20
+#endif
+
+#ifndef MAX_RECV_ITERS
+#define MAX_RECV_ITERS 50
+#endif
+
+
+
+
 
 typedef int (*rewrite_func)(str *, struct packet_stream *);
 
 /* also serves as array index for callstream->peers[] */
 struct iterator_helper {
-	GSList			*del;
+	GSList			*del_timeout;
+	GSList			*del_scheduled;
 	struct stream_fd	*ports[0x10000];
 };
 struct xmlrpc_helper {
+	enum xmlrpc_format fmt;
 	GStringChunk		*c;
 	char			*url;
 	GSList			*tags;
@@ -286,6 +304,9 @@ static const struct mediaproxy_srtp __mps_null = {
 static void unkernelize(struct packet_stream *);
 static void __stream_unkernelize(struct packet_stream *ps);
 static void stream_unkernelize(struct packet_stream *ps);
+static void __monologue_destroy(struct call_monologue *monologue);
+static struct interface_address *get_interface_address(struct local_interface *lif, int family);
+static const GQueue *get_interface_addresses(struct local_interface *lif, int family);
 
 
 
@@ -313,14 +334,11 @@ static void stream_fd_closed(int fd, void *p, uintptr_t u) {
 
 
 INLINE void __mp_address_translate(struct mp_address *o, const struct endpoint *ep) {
-	if (IN6_IS_ADDR_V4MAPPED(&ep->ip46)) {
-		o->family = AF_INET;
-		o->u.ipv4 = ep->ip46.s6_addr32[3];
-	}
-	else {
-		o->family = AF_INET6;
+	o->family = family_from_address(&ep->ip46);
+	if (o->family == AF_INET)
+		o->u.ipv4 = in6_to_4(&ep->ip46);
+	else
 		memcpy(o->u.ipv6, &ep->ip46, sizeof(o->u.ipv6));
-	}
 	o->port = ep->port;
 }
 
@@ -330,6 +348,7 @@ void kernelize(struct packet_stream *stream) {
 	struct call *call = stream->call;
 	struct callmaster *cm = call->callmaster;
 	struct packet_stream *sink = NULL;
+	struct interface_address *ifa;
 
 	if (PS_ISSET(stream, KERNELIZED))
 		return;
@@ -384,10 +403,11 @@ void kernelize(struct packet_stream *stream) {
 	mpt.src_addr.family = mpt.dst_addr.family;
 	mpt.src_addr.port = sink->sfd->fd.localport;
 
+	ifa = g_atomic_pointer_get(&sink->media->local_address);
 	if (mpt.src_addr.family == AF_INET)
-		mpt.src_addr.u.ipv4 = cm->conf.ipv4;
+		mpt.src_addr.u.ipv4 = in6_to_4(&ifa->addr);
 	else
-		memcpy(mpt.src_addr.u.ipv6, &cm->conf.ipv6, sizeof(mpt.src_addr.u.ipv6));
+		memcpy(mpt.src_addr.u.ipv6, &ifa->addr, sizeof(mpt.src_addr.u.ipv6));
 
 	stream->handler->in->kernel(&mpt.decrypt, stream);
 	stream->handler->out->kernel(&mpt.encrypt, sink);
@@ -513,13 +533,16 @@ noop:
 	goto done;
 }
 
-void callmaster_msg_mh_src(struct callmaster *cm, struct msghdr *mh) {
+void stream_msg_mh_src(struct packet_stream *ps, struct msghdr *mh) {
 	struct cmsghdr *ch;
 	struct in_pktinfo *pi;
 	struct in6_pktinfo *pi6;
 	struct sockaddr_in6 *sin6;
+	struct interface_address *ifa;
+
 
 	sin6 = mh->msg_name;
+	ifa = g_atomic_pointer_get(&ps->media->local_address);
 
 	ch = CMSG_FIRSTHDR(mh);
 	ZERO(*ch);
@@ -531,7 +554,7 @@ void callmaster_msg_mh_src(struct callmaster *cm, struct msghdr *mh) {
 
 		pi = (void *) CMSG_DATA(ch);
 		ZERO(*pi);
-		pi->ipi_spec_dst.s_addr = cm->conf.ipv4;
+		pi->ipi_spec_dst.s_addr = in6_to_4(&ifa->addr);
 
 		mh->msg_controllen = CMSG_SPACE(sizeof(*pi));
 	}
@@ -542,20 +565,21 @@ void callmaster_msg_mh_src(struct callmaster *cm, struct msghdr *mh) {
 
 		pi6 = (void *) CMSG_DATA(ch);
 		ZERO(*pi6);
-		pi6->ipi6_addr = cm->conf.ipv6;
+		pi6->ipi6_addr = ifa->addr;
 
 		mh->msg_controllen = CMSG_SPACE(sizeof(*pi6));
 	}
 }
 
 /* called lock-free */
-static int stream_packet(struct stream_fd *sfd, str *s, struct sockaddr_in6 *fsin) {
+static int stream_packet(struct stream_fd *sfd, str *s, struct sockaddr_in6 *fsin, struct in6_addr *dst) {
 	struct packet_stream *stream,
 			     *sink = NULL,
 			     *in_srtp, *out_srtp;
 	struct call_media *media;
 	int ret = 0, update = 0, stun_ret = 0, handler_ret = 0, muxed_rtcp = 0, rtcp = 0,
 	    unk = 0;
+	int i;
 	struct sockaddr_in6 sin6;
 	struct msghdr mh;
 	struct iovec iov;
@@ -566,6 +590,7 @@ static int stream_packet(struct stream_fd *sfd, str *s, struct sockaddr_in6 *fsi
 	char addr[64];
 	struct endpoint endpoint;
 	rewrite_func rwf_in, rwf_out;
+	struct interface_address *loc_addr;
 
 	call = sfd->call;
 	cm = call->callmaster;
@@ -594,11 +619,39 @@ static int stream_packet(struct stream_fd *sfd, str *s, struct sockaddr_in6 *fsi
 		stun_ret = stun(s, stream, fsin);
 		if (!stun_ret)
 			goto done;
-		if (stun_ret == 1) /* use candidate */
+		if (stun_ret == 1) {
+			ilog(LOG_INFO, "STUN: using this candidate");
 			goto use_cand;
+		}
 		else /* not an stun packet */
 			stun_ret = 0;
 	}
+
+#if RTP_LOOP_PROTECT
+	for (i = 0; i < RTP_LOOP_PACKETS; i++) {
+		if (stream->lp_buf[i].len != s->len)
+			continue;
+		if (memcmp(stream->lp_buf[i].buf, s->s, MIN(s->len, RTP_LOOP_PROTECT)))
+			continue;
+
+		__C_DBG("packet dupe");
+		if (stream->lp_count >= RTP_LOOP_MAX_COUNT) {
+			ilog(LOG_WARNING, "More than %d duplicate packets detected, dropping packet "
+					"to avoid potential loop", RTP_LOOP_MAX_COUNT);
+			goto done;
+		}
+
+		stream->lp_count++;
+		goto loop_ok;
+	}
+
+	/* not a dupe */
+	stream->lp_count = 0;
+	stream->lp_buf[stream->lp_idx].len = s->len;
+	memcpy(stream->lp_buf[stream->lp_idx].buf, s->s, MIN(s->len, RTP_LOOP_PROTECT));
+	stream->lp_idx = (stream->lp_idx + 1) % RTP_LOOP_PACKETS;
+loop_ok:
+#endif
 
 	mutex_unlock(&stream->in_lock);
 
@@ -717,6 +770,25 @@ update_addr:
 		update = 1;
 	mutex_unlock(&stream->out_lock);
 
+	/* check the destination address of the received packet against what we think our
+	 * local interface to use is */
+	loc_addr = g_atomic_pointer_get(&media->local_address);
+	if (dst && memcmp(dst, &loc_addr->addr, sizeof(*dst))) {
+		struct interface_address *ifa;
+		char ifa_buf[64];
+		smart_ntop(ifa_buf, dst, sizeof(ifa_buf));
+		ifa = get_interface_from_address(media->interface, dst);
+		if (!ifa) {
+			ilog(LOG_ERROR, "No matching local interface for destination address %s found", ifa_buf);
+			goto drop;
+		}
+		if (g_atomic_pointer_compare_and_exchange(&media->local_address, loc_addr, ifa)) {
+			ilog(LOG_INFO, "Switching local interface to %s", ifa_buf);
+			update = 1;
+		}
+	}
+
+
 kernel_check:
 	if (PS_ISSET(stream, NO_KERNEL_SUPPORT))
 		goto forward;
@@ -746,7 +818,7 @@ forward:
 
 	mutex_unlock(&sink->out_lock);
 
-	callmaster_msg_mh_src(cm, &mh);
+	stream_msg_mh_src(sink, &mh);
 
 	ZERO(iov);
 	iov.iov_base = s->s;
@@ -803,25 +875,43 @@ unlock_out:
 static void stream_fd_readable(int fd, void *p, uintptr_t u) {
 	struct stream_fd *sfd = p;
 	char buf[RTP_BUFFER_SIZE];
-	int ret;
-	struct sockaddr_storage ss;
-	struct sockaddr_in6 sin6;
-	struct sockaddr_in *sin;
-	unsigned int sinlen;
-	void *sinp;
+	int ret, iters;
+	struct sockaddr_in6 sin6_src;
 	int update = 0;
 	struct call *ca;
 	str s;
+	struct msghdr mh;
+	struct iovec iov;
+	char control[128];
+	struct cmsghdr *cmh;
+	struct in6_pktinfo *pi6;
+	struct in6_addr *dst;
 
 	if (sfd->fd.fd != fd)
 		goto out;
 
 	log_info_stream_fd(sfd);
 
-	for (;;) {
-		sinlen = sizeof(ss);
-		ret = recvfrom(fd, buf + RTP_BUFFER_HEAD_ROOM, MAX_RTP_PACKET_SIZE,
-				0, (struct sockaddr *) &ss, &sinlen);
+	for (iters = 0; ; iters++) {
+#if MAX_RECV_ITERS
+		if (iters >= MAX_RECV_ITERS) {
+			ilog(LOG_ERROR, "Too many packets in UDP receive queue (more than %d), "
+					"aborting loop. Dropped packets possible", iters);
+			break;
+		}
+#endif
+
+		ZERO(mh);
+		mh.msg_name = &sin6_src;
+		mh.msg_namelen = sizeof(sin6_src);
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+		mh.msg_control = control;
+		mh.msg_controllen = sizeof(control);
+		iov.iov_base = buf + RTP_BUFFER_HEAD_ROOM;
+		iov.iov_len = MAX_RTP_PACKET_SIZE;
+
+		ret = recvmsg(fd, &mh, 0);
 
 		if (ret < 0) {
 			if (errno == EINTR)
@@ -834,18 +924,16 @@ static void stream_fd_readable(int fd, void *p, uintptr_t u) {
 		if (ret >= MAX_RTP_PACKET_SIZE)
 			ilog(LOG_WARNING, "UDP packet possibly truncated");
 
-		sinp = &ss;
-		if (ss.ss_family == AF_INET) {
-			sin = sinp;
-			sinp = &sin6;
-			ZERO(sin6);
-			sin6.sin6_family = AF_INET6;
-			sin6.sin6_port = sin->sin_port;
-			in4_to_6(&sin6.sin6_addr, sin->sin_addr.s_addr);
+		dst = NULL;
+		for (cmh = CMSG_FIRSTHDR(&mh); cmh; cmh = CMSG_NXTHDR(&mh, cmh)) {
+			if (cmh->cmsg_level == IPPROTO_IPV6 && cmh->cmsg_type == IPV6_PKTINFO) {
+				pi6 = (void *) CMSG_DATA(cmh);
+				dst = &pi6->ipi6_addr;
+			}
 		}
 
 		str_init_len(&s, buf + RTP_BUFFER_HEAD_ROOM, ret);
-		ret = stream_packet(sfd, &s, sinp);
+		ret = stream_packet(sfd, &s, &sin6_src, dst);
 		if (ret == -1) {
 			ilog(LOG_WARNING, "Write error on RTP socket");
 			call_destroy(sfd->call);
@@ -868,6 +956,53 @@ done:
 
 
 
+/* called with call->master_lock held in R */
+static int call_timer_delete_monologues(struct call *c) {
+	GSList *i;
+	struct call_monologue *ml;
+	int ret = 0;
+	time_t min_deleted = 0;
+
+	/* we need a write lock here */
+	rwlock_unlock_r(&c->master_lock);
+	rwlock_lock_w(&c->master_lock);
+
+	for (i = c->monologues; i; i = i->next) {
+		ml = i->data;
+
+		if (!ml->deleted)
+			continue;
+		if (ml->deleted > poller_now) {
+			if (!min_deleted || ml->deleted < min_deleted)
+				min_deleted = ml->deleted;
+			continue;
+		}
+
+		__monologue_destroy(ml);
+		ml->deleted = 0;
+
+		if (!g_hash_table_size(c->tags)) {
+			ilog(LOG_INFO, "Call branch '"STR_FORMAT"' deleted, no more branches remaining",
+					STR_FMT(&ml->tag));
+			ret = 1; /* destroy call */
+			goto out;
+		}
+
+		ilog(LOG_INFO, "Call branch "STR_FORMAT" deleted",
+				STR_FMT(&ml->tag));
+	}
+
+out:
+	c->ml_deleted = min_deleted;
+
+	rwlock_unlock_w(&c->master_lock);
+	rwlock_lock_r(&c->master_lock);
+
+	return ret;
+}
+
+
+
 /* called with callmaster->hashlock held */
 static void call_timer_iterator(void *key, void *val, void *ptr) {
 	struct call *c = val;
@@ -880,6 +1015,16 @@ static void call_timer_iterator(void *key, void *val, void *ptr) {
 	struct stream_fd *sfd;
 
 	rwlock_lock_r(&c->master_lock);
+	log_info_call(c);
+
+	if (c->deleted && poller_now >= c->deleted
+			&& c->last_signal <= c->deleted)
+		goto delete;
+
+	if (c->ml_deleted && poller_now >= c->ml_deleted) {
+		if (call_timer_delete_monologues(c))
+			goto delete;
+	}
 
 	if (!c->streams)
 		goto drop;
@@ -922,17 +1067,19 @@ next:
 	if (good)
 		goto out;
 
-	log_info_call(c);
-	ilog(LOG_INFO, "Closing call branch due to timeout");
-	log_info_clear();
+	ilog(LOG_INFO, "Closing call due to timeout");
 
 drop:
-	rwlock_unlock_r(&c->master_lock);
-	hlp->del = g_slist_prepend(hlp->del, obj_get(c));
-	return;
+	hlp->del_timeout = g_slist_prepend(hlp->del_timeout, obj_get(c));
+	goto out;
+
+delete:
+	hlp->del_scheduled = g_slist_prepend(hlp->del_scheduled, obj_get(c));
+	goto out;
 
 out:
 	rwlock_unlock_r(&c->master_lock);
+	log_info_clear();
 }
 
 void xmlrpc_kill_calls(void *p) {
@@ -979,21 +1126,31 @@ retry:
 		for (i = 0; i < 100; i++)
 			close(i);
 
-		openlog("rtpengine/child", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+		if (!_log_stderr) {
+			openlog("rtpengine/child", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+		}
 		ilog(LOG_INFO, "Initiating XMLRPC call for tag "STR_FORMAT"", STR_FMT(tag));
 
 		alarm(5);
 
 		xmlrpc_env_init(&e);
 		xmlrpc_client_setup_global_const(&e);
-		xmlrpc_client_create(&e, XMLRPC_CLIENT_NO_FLAGS, "ngcp-rtpengine", MEDIAPROXY_VERSION,
+		xmlrpc_client_create(&e, XMLRPC_CLIENT_NO_FLAGS, "ngcp-rtpengine", RTPENGINE_VERSION,
 			NULL, 0, &c);
 		if (e.fault_occurred)
 			goto fault;
 
 		r = NULL;
-		xmlrpc_client_call2f(&e, c, xh->url, "di", &r, "(ssss)",
-			"sbc", "postControlCmd", tag->s, "teardown");
+		switch (xh->fmt) {
+		case XF_SEMS:
+			xmlrpc_client_call2f(&e, c, xh->url, "di", &r, "(ssss)",
+						"sbc", "postControlCmd", tag->s, "teardown");
+			break;
+		case XF_CALLID:
+			xmlrpc_client_call2f(&e, c, xh->url, "teardown", &r, "(s)", tag->s);
+			break;
+		}
+
 		if (r)
 			xmlrpc_DECREF(r);
 		if (e.fault_occurred)
@@ -1022,16 +1179,16 @@ void kill_calls_timer(GSList *list, struct callmaster *m) {
 	struct xmlrpc_helper *xh = NULL;
 
 	if (!list)
-		return; /* shouldn't happen */
+		return;
 
-	ca = list->data;
-	m = ca->callmaster; /* same callmaster for all of them */
-	url = m->conf.b2b_url;
+	/* if m is NULL, it's the scheduled deletions, otherwise it's the timeouts */
+	url = m ? m->conf.b2b_url : NULL;
 	if (url) {
 		xh = g_slice_alloc(sizeof(*xh));
 		xh->c = g_string_chunk_new(64);
 		xh->url = g_string_chunk_insert(xh->c, url);
 		xh->tags = NULL;
+		xh->fmt = m->conf.fmt;
 	}
 
 	while (list) {
@@ -1042,13 +1199,18 @@ void kill_calls_timer(GSList *list, struct callmaster *m) {
 
 		rwlock_lock_r(&ca->master_lock);
 
-		for (csl = ca->monologues; csl; csl = csl->next) {
-			cm = csl->data;
-			if (!cm->tag.s || !cm->tag.len)
-				goto next;
-			xh->tags = g_slist_prepend(xh->tags, str_chunk_insert(xh->c, &cm->tag));
-next:
-			;
+		switch (m->conf.fmt) {
+		case XF_SEMS:
+			for (csl = ca->monologues; csl; csl = csl->next) {
+				cm = csl->data;
+				if (cm->tag.s && cm->tag.len) {
+					xh->tags = g_slist_prepend(xh->tags, str_chunk_insert(xh->c, &cm->tag));
+				}
+			}
+			break;
+		case XF_CALLID:
+			xh->tags = g_slist_prepend(xh->tags, str_chunk_insert(xh->c, &ca->callid));
+			break;
 		}
 
 		rwlock_unlock_r(&ca->master_lock);
@@ -1170,10 +1332,8 @@ next:
 		if (hlp.ports[j])
 			obj_put(hlp.ports[j]);
 
-	if (!hlp.del)
-		return;
-
-	kill_calls_timer(hlp.del, m);
+	kill_calls_timer(hlp.del_scheduled, NULL);
+	kill_calls_timer(hlp.del_timeout, m);
 }
 #undef DS
 
@@ -1224,6 +1384,12 @@ static void __set_tos(int fd, const struct call *c) {
 #endif
 }
 
+static void __get_pktinfo(int fd) {
+	int x;
+	x = 1;
+	setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &x, sizeof(x));
+}
+
 static int get_port6(struct udp_fd *r, u_int16_t p, const struct call *c) {
 	int fd;
 	struct sockaddr_in6 sin;
@@ -1236,6 +1402,7 @@ static int get_port6(struct udp_fd *r, u_int16_t p, const struct call *c) {
 	reuseaddr(fd);
 	ipv6only(fd, 0);
 	__set_tos(fd, c);
+	__get_pktinfo(fd);
 
 	ZERO(sin);
 	sin.sin6_family = AF_INET6;
@@ -1300,7 +1467,7 @@ static void release_port(struct udp_fd *r, struct callmaster *m) {
 int __get_consecutive_ports(struct udp_fd *array, int array_len, int wanted_start_port, const struct call *c) {
 	int i, j, cycle = 0;
 	struct udp_fd *it;
-	u_int16_t port;
+	int port;
 	struct callmaster *m = c->callmaster;
 
 	memset(array, -1, sizeof(*array) * array_len);
@@ -1311,6 +1478,9 @@ int __get_consecutive_ports(struct udp_fd *array, int array_len, int wanted_star
 		mutex_lock(&m->portlock);
 		port = m->lastport;
 		mutex_unlock(&m->portlock);
+#if PORT_RANDOM_MIN && PORT_RANDOM_MAX
+		port += PORT_RANDOM_MIN + (random() % (PORT_RANDOM_MAX - PORT_RANDOM_MIN));
+#endif
 	}
 
 	while (1) {
@@ -1733,7 +1903,7 @@ static void __generate_crypto(const struct sdp_ng_flags *flags, struct call_medi
 	}
 
 	/* for answer case, otherwise we default to one */
-	this->sdes_out.tag = this->sdes_in.params.crypto_suite ? this->sdes_in.tag : 1;
+	this->sdes_out.tag = cp_in->crypto_suite ? this->sdes_in.tag : 1;
 
 	if (other->sdes_in.params.crypto_suite) {
 		/* SRTP <> SRTP case, copy from other stream */
@@ -1859,10 +2029,10 @@ static void __tos_change(struct call *call, const struct sdp_ng_flags *flags) {
 	/* Handle TOS= parameter. Negative value = no change, not present or too large =
 	 * revert to default, otherwise set specified value. We only do it in an offer, but
 	 * then for both directions. */
-	if (flags->opmode != OP_OFFER || flags->tos < 0)
+	if (flags && (flags->opmode != OP_OFFER || flags->tos < 0))
 		return;
 
-	if (flags->tos > 255)
+	if (!flags || flags->tos > 255)
 		new_tos = call->callmaster->conf.default_tos;
 	else
 		new_tos = flags->tos;
@@ -1874,25 +2044,64 @@ static void __tos_change(struct call *call, const struct sdp_ng_flags *flags) {
 	__set_all_tos(call);
 }
 
+static void __init_interface(struct call_media *media, const str *ifname) {
+	/* we're holding master_lock in W mode here, so we can safely ignore the
+	 * atomic ops */
+	struct interface_address *ifa = (void *) media->local_address;
+
+	if (!media->interface || !ifa)
+		goto get;
+	if (!ifname || !ifname->s)
+		return;
+	if (!str_cmp_str(&media->interface->name, ifname))
+		return;
+get:
+	media->interface = get_local_interface(media->call->callmaster, ifname);
+	if (!media->interface) {
+		media->interface = get_local_interface(media->call->callmaster, NULL);
+		/* legacy support */
+		if (!str_cmp(ifname, "internal"))
+			media->desired_family = AF_INET;
+		else if (!str_cmp(ifname, "external"))
+			media->desired_family = AF_INET6;
+		else
+			ilog(LOG_WARNING, "Interface '"STR_FORMAT"' not found, using default", STR_FMT(ifname));
+	}
+	media->local_address = ifa = get_interface_address(media->interface, media->desired_family);
+	if (!ifa) {
+		ilog(LOG_WARNING, "No usable address in interface '"STR_FORMAT"' found, using default",
+				STR_FMT(ifname));
+		media->local_address = ifa = get_any_interface_address(media->interface, media->desired_family);
+		media->desired_family = family_from_address(&ifa->addr);
+	}
+}
+
 /* called with call->master_lock held in W */
-int monologue_offer_answer(struct call_monologue *monologue, GQueue *streams,
+int monologue_offer_answer(struct call_monologue *other_ml, GQueue *streams,
 		const struct sdp_ng_flags *flags)
 {
 	struct stream_params *sp;
 	GList *media_iter, *ml_media, *other_ml_media;
 	struct call_media *media, *other_media;
 	unsigned int num_ports;
-	struct call_monologue *other_ml = monologue->active_dialogue;
+	struct call_monologue *monologue = other_ml->active_dialogue;
 	struct endpoint_map *em;
+	struct call *call;
 
-	monologue->call->last_signal = poller_now;
+	call = monologue->call;
 
-	/* we must have a complete dialogue, even though the to-tag (other_ml->tag)
+	call->last_signal = poller_now;
+	call->deleted = 0;
+
+	/* we must have a complete dialogue, even though the to-tag (monologue->tag)
 	 * may not be known yet */
-	if (!other_ml)
+	if (!other_ml) {
+		ilog(LOG_ERROR, "Incomplete dialogue association");
 		return -1;
+	}
+	__C_DBG("this="STR_FORMAT" other="STR_FORMAT, STR_FMT(&monologue->tag), STR_FMT(&other_ml->tag));
 
-	__tos_change(monologue->call, flags);
+	__tos_change(call, flags);
 
 	ml_media = other_ml_media = NULL;
 
@@ -1904,9 +2113,12 @@ int monologue_offer_answer(struct call_monologue *monologue, GQueue *streams,
 		 * the dialogue */
 		media = __get_media(monologue, &ml_media, sp);
 		other_media = __get_media(other_ml, &other_ml_media, sp);
-		/* THIS side corresponds to what's being sent to the recipient of the
-		 * offer/answer. The OTHER side corresponds to what WILL BE sent to the
-		 * offerer or WAS sent to the answerer. */
+		/* OTHER is the side which has sent the message. SDP parameters in
+		 * "sp" are as advertised by OTHER side. The message will be sent to
+		 * THIS side. Parameters sent to THIS side may be overridden by
+		 * what's in "flags". If this is an answer, or if we have talked to
+		 * THIS side (recipient) before, then the structs will be populated with
+		 * details already. */
 
 		/* deduct protocol from stream parameters received */
 		if (other_media->protocol != sp->protocol) {
@@ -1931,11 +2143,13 @@ int monologue_offer_answer(struct call_monologue *monologue, GQueue *streams,
 		if (other_media->sdes_in.params.crypto_suite)
 			MEDIA_SET(other_media, SDES);
 
+		/* send and recv are from our POV */
 		bf_copy_same(&media->media_flags, &sp->sp_flags,
 				SP_FLAG_SEND | SP_FLAG_RECV);
 		bf_copy(&other_media->media_flags, MEDIA_FLAG_RECV, &sp->sp_flags, SP_FLAG_SEND);
 		bf_copy(&other_media->media_flags, MEDIA_FLAG_SEND, &sp->sp_flags, SP_FLAG_RECV);
 
+		/* active and passive are also from our POV */
 		bf_copy(&other_media->media_flags, MEDIA_FLAG_SETUP_PASSIVE,
 				&sp->sp_flags, SP_FLAG_SETUP_ACTIVE);
 		bf_copy(&other_media->media_flags, MEDIA_FLAG_SETUP_ACTIVE,
@@ -1959,16 +2173,17 @@ int monologue_offer_answer(struct call_monologue *monologue, GQueue *streams,
 		__generate_crypto(flags, media, other_media);
 
 		/* deduct address family from stream parameters received */
-		other_media->desired_family = AF_INET;
-		if (!IN6_IS_ADDR_V4MAPPED(&sp->rtp_endpoint.ip46))
-			other_media->desired_family = AF_INET6;
-		/* for outgoing SDP, use "direction"/DF or default to IPv4 (?) */
+		other_media->desired_family = family_from_address(&sp->rtp_endpoint.ip46);
+		/* for outgoing SDP, use "direction"/DF or default to what was offered */
 		if (!media->desired_family)
-			media->desired_family = AF_INET;
+			media->desired_family = other_media->desired_family;
 		if (sp->desired_family)
 			media->desired_family = sp->desired_family;
-		else if (sp->direction[1] == DIR_EXTERNAL)
-			media->desired_family = AF_INET6;
+
+
+		/* local interface selection */
+		__init_interface(media, &sp->direction[1]);
+		__init_interface(other_media, &sp->direction[0]);
 
 
 		/* we now know what's being advertised by the other side */
@@ -2127,11 +2342,10 @@ void call_destroy(struct call *c) {
 
 
 
-typedef int (*csa_func)(char *o, struct packet_stream *ps, enum stream_address_format format, int *len);
-
-static int call_stream_address4(char *o, struct packet_stream *ps, enum stream_address_format format, int *len) {
+static int call_stream_address4(char *o, struct packet_stream *ps, enum stream_address_format format,
+		int *len, struct interface_address *ifa)
+{
 	u_int32_t ip4;
-	struct callmaster *m = ps->call->callmaster;
 	int l = 0;
 
 	if (format == SAF_NG) {
@@ -2139,22 +2353,22 @@ static int call_stream_address4(char *o, struct packet_stream *ps, enum stream_a
 		l = 4;
 	}
 
-	ip4 = ps->advertised_endpoint.ip46.s6_addr32[3];
-	if (!ip4) {
+	if (!in6_to_4(&ps->advertised_endpoint.ip46)) {
 		strcpy(o + l, "0.0.0.0");
 		l += 7;
 	}
-	else if (m->conf.adv_ipv4)
-		l += sprintf(o + l, IPF, IPP(m->conf.adv_ipv4));
-	else
-		l += sprintf(o + l, IPF, IPP(m->conf.ipv4));
+	else {
+		ip4 = in6_to_4(&ifa->advertised);
+		l += sprintf(o + l, IPF, IPP(ip4));
+	}
 
 	*len = l;
 	return AF_INET;
 }
 
-static int call_stream_address6(char *o, struct packet_stream *ps, enum stream_address_format format, int *len) {
-	struct callmaster *m = ps->call->callmaster;
+static int call_stream_address6(char *o, struct packet_stream *ps, enum stream_address_format format,
+		int *len, struct interface_address *ifa)
+{
 	int l = 0;
 
 	if (format == SAF_NG) {
@@ -2167,10 +2381,7 @@ static int call_stream_address6(char *o, struct packet_stream *ps, enum stream_a
 		l += 2;
 	}
 	else {
-		if (!is_addr_unspecified(&m->conf.adv_ipv6))
-			inet_ntop(AF_INET6, &m->conf.adv_ipv6, o + l, 45); /* lies... */
-		else
-			inet_ntop(AF_INET6, &m->conf.ipv6, o + l, 45);
+		inet_ntop(AF_INET6, &ifa->advertised, o + l, 45); /* lies ... */
 		l += strlen(o + l);
 	}
 
@@ -2178,55 +2389,29 @@ static int call_stream_address6(char *o, struct packet_stream *ps, enum stream_a
 	return AF_INET6;
 }
 
-static csa_func __call_stream_address(struct packet_stream *ps, int variant) {
-	struct callmaster *m;
+
+int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address_format format,
+		int *len, struct interface_address *ifa)
+{
 	struct packet_stream *sink;
-	struct call_media *sink_media;
-	csa_func variants[2];
 
-	assert(variant >= 0);
-	assert(variant < G_N_ELEMENTS(variants));
-
-	m = ps->call->callmaster;
 	sink = packet_stream_sink(ps);
-	sink_media = sink->media;
-
-	variants[0] = call_stream_address4;
-	variants[1] = call_stream_address6;
-
-	if (is_addr_unspecified(&m->conf.ipv6)) {
-		variants[1] = NULL;
-		goto done;
-	}
-	if (sink_media->desired_family == AF_INET)
-		goto done;
-	if (sink_media->desired_family == 0 && IN6_IS_ADDR_V4MAPPED(&sink->endpoint.ip46))
-		goto done;
-	if (sink_media->desired_family == 0 && is_addr_unspecified(&sink->advertised_endpoint.ip46))
-		goto done;
-
-	variants[0] = call_stream_address6;
-	variants[1] = call_stream_address4;
-	goto done;
-
-done:
-	return variants[variant];
+	if (ifa->family == AF_INET)
+		return call_stream_address4(o, sink, format, len, ifa);
+	return call_stream_address6(o, sink, format, len, ifa);
 }
 
 int call_stream_address(char *o, struct packet_stream *ps, enum stream_address_format format, int *len) {
-	csa_func f;
+	struct interface_address *ifa;
+	struct call_media *media;
 
-	ps = packet_stream_sink(ps);
-	f = __call_stream_address(ps, 0);
-	return f(o, ps, format, len);
-}
+	media = ps->media;
 
-int call_stream_address_alt(char *o, struct packet_stream *ps, enum stream_address_format format, int *len) {
-	csa_func f;
+	ifa = g_atomic_pointer_get(&media->local_address);
+	if (!ifa)
+		return -1;
 
-	ps = packet_stream_sink(ps);
-	f = __call_stream_address(ps, 1);
-	return f ? f(o, ps, format, len) : -1;
+	return call_stream_address46(o, ps, format, len, ifa);
 }
 
 
@@ -2404,6 +2589,9 @@ static void __monologue_unkernelize(struct call_monologue *monologue) {
 	if (!monologue)
 		return;
 
+	monologue->deleted = 0; /* not really related, but indicates activity, so cancel
+				   any pending deletion */
+
 	for (l = monologue->medias.head; l; l = l->next) {
 		media = l->data;
 
@@ -2565,16 +2753,17 @@ int call_delete_branch(struct callmaster *m, const str *callid, const str *branc
 	}
 */
 
-	__monologue_destroy(ml);
-	if (g_hash_table_size(c->tags)) {
-		ilog(LOG_INFO, "Call branch deleted (other branches still active)");
-		goto success_unlock;
-	}
+	ilog(LOG_INFO, "Scheduling deletion of call branch '"STR_FORMAT"' in %d seconds",
+			STR_FMT(&ml->tag), DELETE_DELAY);
+	ml->deleted = poller_now + 30;
+	if (!c->ml_deleted || c->ml_deleted > ml->deleted)
+		c->ml_deleted = ml->deleted;
+	goto success_unlock;
 
 del_all:
+	ilog(LOG_INFO, "Scheduling deletion of entire call in %d seconds", DELETE_DELAY);
+	c->deleted = poller_now + DELETE_DELAY;
 	rwlock_unlock_w(&c->master_lock);
-	ilog(LOG_INFO, "Deleting full call");
-	call_destroy(c);
 	goto success;
 
 success_unlock:
@@ -2603,7 +2792,7 @@ static void callmaster_get_all_calls_interator(void *key, void *val, void *ptr) 
 
 void callmaster_get_all_calls(struct callmaster *m, GQueue *q) {
 	rwlock_lock_r(&m->hashlock);
-	g_hash_table_foreach(m->callhash, callmaster_get_all_calls_interator, &q);
+	g_hash_table_foreach(m->callhash, callmaster_get_all_calls_interator, q);
 	rwlock_unlock_r(&m->hashlock);
 
 }
@@ -2641,5 +2830,105 @@ const struct transport_protocol *transport_protocol(const str *s) {
 	}
 
 out:
+	return NULL;
+}
+
+void callmaster_config_init(struct callmaster *m) {
+	GList *l;
+	struct interface_address *ifa;
+	struct local_interface *lif;
+
+	m->interfaces = g_hash_table_new(str_hash, str_equal);
+
+	for (l = m->conf.interfaces->head; l; l = l->next) {
+		ifa = l->data;
+
+		lif = g_hash_table_lookup(m->interfaces, &ifa->interface_name);
+		if (!lif) {
+			lif = g_slice_alloc0(sizeof(*lif));
+			lif->name = ifa->interface_name;
+			g_hash_table_insert(m->interfaces, &lif->name, lif);
+			g_queue_push_tail(&m->interface_list, lif);
+		}
+
+		if (IN6_IS_ADDR_V4MAPPED(&ifa->addr))
+			g_queue_push_tail(&lif->ipv4, ifa);
+		else
+			g_queue_push_tail(&lif->ipv6, ifa);
+
+		sdp_ice_foundation(ifa);
+	}
+}
+
+struct local_interface *get_local_interface(struct callmaster *m, const str *name) {
+	struct local_interface *lif;
+
+	if (!name || !name->s)
+		return m->interface_list.head->data;
+
+	lif = g_hash_table_lookup(m->interfaces, name);
+	return lif;
+}
+
+static const GQueue *get_interface_addresses(struct local_interface *lif, int family) {
+	if (!lif)
+		return NULL;
+
+	switch (family) {
+		case AF_INET:
+			return &lif->ipv4;
+			break;
+		case AF_INET6:
+			return &lif->ipv6;
+			break;
+		default:
+			return NULL;
+	}
+}
+
+static struct interface_address *get_interface_address(struct local_interface *lif, int family) {
+	const GQueue *q;
+
+	q = get_interface_addresses(lif, family);
+	if (!q || !q->head)
+		return NULL;
+	return q->head->data;
+}
+
+/* safety fallback */
+struct interface_address *get_any_interface_address(struct local_interface *lif, int family) {
+	struct interface_address *ifa;
+	GQueue q = G_QUEUE_INIT;
+
+	get_all_interface_addresses(&q, lif, family);
+	ifa = q.head->data;
+	g_queue_clear(&q);
+	return ifa;
+}
+
+void get_all_interface_addresses(GQueue *q, struct local_interface *lif, int family) {
+	g_queue_append(q, get_interface_addresses(lif, family));
+	if (family == AF_INET)
+		g_queue_append(q, get_interface_addresses(lif, AF_INET6));
+	else
+		g_queue_append(q, get_interface_addresses(lif, AF_INET));
+}
+
+struct interface_address *get_interface_from_address(struct local_interface *lif, const struct in6_addr *addr) {
+	GQueue *q;
+	GList *l;
+	struct interface_address *ifa;
+
+	if (IN6_IS_ADDR_V4MAPPED(addr))
+		q = &lif->ipv4;
+	else
+		q = &lif->ipv6;
+
+	for (l = q->head; l; l = l->next) {
+		ifa = l->data;
+		if (!memcmp(&ifa->addr, addr, sizeof(*addr)))
+			return ifa;
+	}
+
 	return NULL;
 }

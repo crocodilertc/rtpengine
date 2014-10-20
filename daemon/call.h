@@ -20,11 +20,6 @@ enum stream_address_format {
 	SAF_NG,
 	SAF_ICE,
 };
-enum stream_direction {
-	DIR_UNKNOWN = 0,
-	DIR_INTERNAL,
-	DIR_EXTERNAL,
-};
 enum call_opmode {
 	OP_OFFER = 0,
 	OP_ANSWER = 1,
@@ -39,6 +34,11 @@ enum transport_protocol_index {
 	PROTO_UDP_TLS_RTP_SAVP,
 	PROTO_UDP_TLS_RTP_SAVPF,
 	PROTO_UDPTL,
+};
+
+enum xmlrpc_format {
+	XF_SEMS = 0,
+	XF_CALLID,
 };
 
 struct call_monologue;
@@ -59,6 +59,12 @@ struct call_monologue;
 #define RTP_BUFFER_HEAD_ROOM	128
 #define RTP_BUFFER_TAIL_ROOM	512
 #define RTP_BUFFER_SIZE		(MAX_RTP_PACKET_SIZE + RTP_BUFFER_HEAD_ROOM + RTP_BUFFER_TAIL_ROOM)
+
+#ifndef RTP_LOOP_PROTECT
+#define RTP_LOOP_PROTECT	16 /* number of bytes */
+#define RTP_LOOP_PACKETS	2  /* number of packets */
+#define RTP_LOOP_MAX_COUNT	30 /* number of consecutively detected dupes to trigger protection */
+#endif
 
 #ifdef __DEBUG
 #define __C_DBG(x...) ilog(LOG_DEBUG, x)
@@ -145,6 +151,7 @@ struct crypto_suite;
 struct mediaproxy_srtp;
 struct streamhandler;
 struct sdp_ng_flags;
+struct local_interface;
 
 
 typedef bencode_buffer_t call_buffer_t;
@@ -189,7 +196,7 @@ struct stream_params {
 	const struct transport_protocol *protocol;
 	struct crypto_params	crypto;
 	unsigned int		sdes_tag;
-	enum stream_direction	direction[2];
+	str			direction[2];
 	int			desired_family;
 	struct dtls_fingerprint fingerprint;
 	unsigned int		sp_flags;
@@ -208,6 +215,11 @@ struct endpoint_map {
 	struct endpoint		endpoint;
 	GQueue			sfds;
 	int			wildcard:1;
+};
+
+struct loop_protector {
+	unsigned int		len;
+	unsigned char		buf[RTP_LOOP_PROTECT];
 };
 
 struct packet_stream {
@@ -233,6 +245,13 @@ struct packet_stream {
 	struct stats		kernel_stats;	/* LOCK: in_lock */
 	time_t			last_packet;	/* LOCK: in_lock */
 
+#if RTP_LOOP_PROTECT
+	/* LOCK: in_lock: */
+	unsigned int		lp_idx;
+	struct loop_protector	lp_buf[RTP_LOOP_PACKETS];
+	unsigned int		lp_count;
+#endif
+
 	X509			*dtls_cert;	/* LOCK: in_lock */
 
 	/* in_lock must be held for SETTING these: */
@@ -249,6 +268,12 @@ struct call_media {
 	str			type;		/* RO */
 	const struct transport_protocol *protocol;
 	int			desired_family;
+	struct local_interface	*interface;
+
+	/* local_address is protected by call->master_lock in W mode, but may
+	 * still be modified if the lock is held in R mode, therefore we use
+	 * atomic ops to access it when holding an R lock. */
+	volatile struct interface_address *local_address;
 
 	str			ice_ufrag;
 	str			ice_pwd;
@@ -273,6 +298,7 @@ struct call_monologue {
 
 	str			tag;	
 	time_t			created;	/* RO */
+	time_t			deleted;
 	GHashTable		*other_tags;
 	struct call_monologue	*active_dialogue;
 
@@ -299,16 +325,29 @@ struct call {
 	str			callid;	
 	time_t			created;
 	time_t			last_signal;
+	time_t			deleted;
+	time_t			ml_deleted;
 	unsigned char		tos;
+};
+
+struct local_interface {
+	str			name;
+	GQueue			ipv4; /* struct interface_address */
+	GQueue			ipv6; /* struct interface_address */
+};
+struct interface_address {
+	str			interface_name;
+	int			family;
+	struct in6_addr		addr;
+	struct in6_addr		advertised;
+	str			ice_foundation;
+	char			foundation_buf[16];
 };
 
 struct callmaster_config {
 	int			kernelfd;
 	int			kernelid;
-	u_int32_t		ipv4;
-	u_int32_t		adv_ipv4;
-	struct in6_addr		ipv6;
-	struct in6_addr		adv_ipv6;
+	GQueue			*interfaces; /* struct interface_address */
 	int			port_min;
 	int			port_max;
 	unsigned int		timeout;
@@ -316,6 +355,7 @@ struct callmaster_config {
 	struct redis		*redis;
 	char			*b2b_url;
 	unsigned char		default_tos;
+	enum xmlrpc_format	fmt;
 };
 
 struct callmaster {
@@ -323,6 +363,9 @@ struct callmaster {
 
 	rwlock_t		hashlock;
 	GHashTable		*callhash;
+
+	GHashTable		*interfaces; /* struct local_interface */
+	GQueue			interface_list; /* ditto */
 
 	mutex_t			portlock;
 	u_int16_t		lastport;
@@ -351,7 +394,8 @@ struct call_stats {
 
 
 struct callmaster *callmaster_new(struct poller *);
-void callmaster_msg_mh_src(struct callmaster *, struct msghdr *);
+void callmaster_config_init(struct callmaster *);
+void stream_msg_mh_src(struct packet_stream *, struct msghdr *);
 void callmaster_get_all_calls(struct callmaster *m, GQueue *q);
 
 
@@ -369,6 +413,7 @@ const char *call_offer_ng(bencode_item_t *, struct callmaster *, bencode_item_t 
 const char *call_answer_ng(bencode_item_t *, struct callmaster *, bencode_item_t *);
 const char *call_delete_ng(bencode_item_t *, struct callmaster *, bencode_item_t *);
 const char *call_query_ng(bencode_item_t *, struct callmaster *, bencode_item_t *);
+const char *call_list_ng(bencode_item_t *, struct callmaster *, bencode_item_t *);
 
 
 void calls_dump_redis(struct callmaster *);
@@ -388,8 +433,13 @@ int call_delete_branch(struct callmaster *m, const str *callid, const str *branc
 void call_destroy(struct call *);
 
 void kernelize(struct packet_stream *);
-int call_stream_address_alt(char *, struct packet_stream *, enum stream_address_format, int *);
 int call_stream_address(char *, struct packet_stream *, enum stream_address_format, int *);
+int call_stream_address46(char *o, struct packet_stream *ps, enum stream_address_format format,
+		int *len, struct interface_address *ifa);
+void get_all_interface_addresses(GQueue *q, struct local_interface *lif, int family);
+struct local_interface *get_local_interface(struct callmaster *m, const str *name);
+struct interface_address *get_any_interface_address(struct local_interface *lif, int family);
+struct interface_address *get_interface_from_address(struct local_interface *lif, const struct in6_addr *addr);
 
 const struct transport_protocol *transport_protocol(const str *s);
 
@@ -442,9 +492,6 @@ INLINE str *call_str_init_dup(struct call *c, char *s) {
 	str t;
 	str_init(&t, s);
 	return call_str_dup(c, &t);
-}
-INLINE int callmaster_has_ipv6(struct callmaster *m) {
-	return is_addr_unspecified(&m->conf.ipv6) ? 0 : 1;
 }
 INLINE void callmaster_exclude_port(struct callmaster *m, u_int16_t p) {
 	/* XXX atomic bit field? */

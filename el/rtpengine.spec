@@ -1,5 +1,5 @@
 Name:		ngcp-rtpengine
-Version:	3.3.0
+Version:	2.3.6
 Release:	0%{?dist}
 Summary:	The Sipwise NGCP rtpengine
 
@@ -63,9 +63,9 @@ cd ..
 install -D -p -m755 daemon/rtpengine %{buildroot}/%{_sbindir}/rtpengine
 
 ## Install the init.d script and configuration file
-install -D -p -m755 el/ngcp-rtpengine.init \
+install -D -p -m755 el/rtpengine.init \
 	%{buildroot}/%{_sysconfdir}/rc.d/init.d/rtpengine
-install -D -p -m644 el/ngcp-rtpengine.sysconfig \
+install -D -p -m644 el/rtpengine.sysconfig \
 	%{buildroot}/%{_sysconfdir}/sysconfig/rtpengine
 mkdir -p %{buildroot}/%{_sharedstatedir}/rtpengine
 
@@ -97,7 +97,7 @@ rm -rf %{buildroot}
 
 %post
 if [ $1 -eq 1 ]; then
-        /sbin/chkconfig --add rtpengine || :
+        /sbin/chkconfig --add %{name} || :
 fi
 
 
@@ -111,8 +111,8 @@ true
 
 %preun
 if [ $1 = 0 ] ; then
-        /sbin/service rtpengine stop >/dev/null 2>&1
-        /sbin/chkconfig --del rtpengine
+        /sbin/service %{name} stop >/dev/null 2>&1
+        /sbin/chkconfig --del %{name}
 fi
 
 
@@ -144,9 +144,6 @@ true
 
 
 %changelog
-* Thu May 15 2014 Hugh Waite <hugh.waite@acision.com>
-  - Rename to rtpengine
-  - Updated version to 3.3.0
 * Mon Nov 11 2013 Peter Dunkley <peter.dunkley@crocodilertc.net>
   - Updated version to 2.3.2
   - Set license to GPLv3

@@ -141,6 +141,9 @@ INLINE void in4_to_6(struct in6_addr *o, u_int32_t ip) {
 	o->s6_addr32[2] = htonl(0xffff);
 	o->s6_addr32[3] = ip;
 }
+INLINE u_int32_t in6_to_4(const struct in6_addr *a) {
+	return a->s6_addr32[3];
+}
 
 INLINE void smart_ntop(char *o, struct in6_addr *a, size_t len) {
 	const char *r;
@@ -200,6 +203,23 @@ INLINE int smart_pton(int af, char *src, void *dst) {
 		}
 	}
 	return inet_pton(af, src, dst);
+}
+
+INLINE int pton_46(struct in6_addr *dst, const char *src, int *family) {
+	u_int32_t in4;
+
+	if (inet_pton(AF_INET6, src, dst) == 1) {
+		if (family)
+			*family = AF_INET6;
+		return 0;
+	}
+	in4 = inet_addr(src);
+	if (in4 == INADDR_NONE)
+		return -1;
+	in4_to_6(dst, in4);
+	if (family)
+		*family = AF_INET;
+	return 0;
 }
 
 INLINE int strmemcmp(const void *mem, int len, const char *str) {
@@ -362,6 +382,12 @@ INLINE int is_addr_unspecified(const struct in6_addr *a) {
 	return 0;
 }
 
+INLINE int family_from_address(const struct in6_addr *a) {
+	if (IN6_IS_ADDR_V4MAPPED(a))
+		return AF_INET;
+	return AF_INET6;
+}
+
 /* checks if at least one of the flags is set */
 INLINE int bf_isset(const unsigned int *u, unsigned int f) {
 	if ((*u & f))
@@ -390,6 +416,13 @@ INLINE void bf_copy(unsigned int *u, unsigned int f, const unsigned int *s, unsi
 /* works for multiple flags */
 INLINE void bf_copy_same(unsigned int *u, const unsigned int *s, unsigned int g) {
 	bf_copy(u, g, s, g);
+}
+INLINE void g_queue_append(GQueue *dst, const GQueue *src) {
+	GList *l;
+	if (!src || !dst)
+		return;
+	for (l = src->head; l; l = l->next)
+		g_queue_push_tail(dst, l->data);
 }
 
 #endif

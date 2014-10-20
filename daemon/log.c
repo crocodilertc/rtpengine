@@ -5,17 +5,92 @@
 #include <glib.h>
 #include "str.h"
 #include "call.h"
+#include "poller.h"
 
 
 
 struct log_info __thread log_info;
+#ifndef __DEBUG
 volatile gint log_level = LOG_INFO;
+#else
+volatile gint log_level = LOG_DEBUG;
+#endif
+
+#ifndef MAX_LOG_LINE_LENGTH
+#define MAX_LOG_LINE_LENGTH 500
+#endif
+
+write_log_t write_log = (write_log_t) syslog;
+
+const _fac_code_t _facilitynames[] =
+	{
+		{ "auth", LOG_AUTH },
+		{ "authpriv", LOG_AUTHPRIV },
+		{ "cron", LOG_CRON },
+		{ "daemon", LOG_DAEMON },
+		{ "ftp", LOG_FTP },
+		{ "kern", LOG_KERN },
+		{ "lpr", LOG_LPR },
+		{ "mail", LOG_MAIL },
+		{ "news", LOG_NEWS },
+		{ "syslog", LOG_SYSLOG },
+		{ "user", LOG_USER },
+		{ "uucp", LOG_UUCP },
+		{ "local0", LOG_LOCAL0 },
+		{ "local1", LOG_LOCAL1 },
+		{ "local2", LOG_LOCAL2 },
+		{ "local3", LOG_LOCAL3 },
+		{ "local4", LOG_LOCAL4 },
+		{ "local5", LOG_LOCAL5 },
+		{ "local6", LOG_LOCAL6 },
+		{ "local7", LOG_LOCAL7 },
+		{ NULL, -1 }
+	};
+
+const char const* prio_str[] = {
+		"EMERG",
+		"ALERT",
+		"CRIT",
+		"ERR",
+		"WARNING",
+		"NOTICE",
+		"INFO",
+		"DEBUG"
+	};
+
+gboolean _log_stderr = 0;
+int _log_facility = LOG_DAEMON;
 
 
+static GHashTable *__log_limiter;
+static mutex_t __log_limiter_lock;
+static GStringChunk *__log_limiter_strings;
+static unsigned int __log_limiter_count;
+
+
+void log_to_stderr(int facility_priority, char *format, ...) {
+	char *msg;
+	int ret;
+	va_list ap;
+
+	va_start(ap, format);
+	ret = vasprintf(&msg, format, ap);
+	va_end(ap);
+
+	if (ret < 0) {
+		fprintf(stderr,"ERR: Failed to print log message - message dropped\n");
+		return;
+	}
+
+	fprintf(stderr, "%s: %s\n", prio_str[facility_priority & LOG_PRIMASK], msg);
+
+	free(msg);
+}
 
 void ilog(int prio, const char *fmt, ...) {
 	char prefix[256];
-	char *msg;
+	char *msg, *piece;
+	const char *infix = "";
 	va_list ap;
 	int ret, xprio;
 
@@ -51,13 +126,53 @@ void ilog(int prio, const char *fmt, ...) {
 	va_end(ap);
 
 	if (ret < 0) {
-		syslog(LOG_ERROR, "Failed to print syslog message - message dropped");
+		write_log(LOG_ERROR, "Failed to print syslog message - message dropped");
 		return;
 	}
 
-	syslog(xprio, "%s%s", prefix, msg);
+	if ((prio & LOG_FLAG_LIMIT)) {
+		time_t when;
 
+		mutex_lock(&__log_limiter_lock);
+
+		if (__log_limiter_count > 10000) {
+			g_hash_table_remove_all(__log_limiter);
+			g_string_chunk_clear(__log_limiter_strings);
+			__log_limiter_count = 0;
+		}
+
+		when = (time_t) g_hash_table_lookup(__log_limiter, msg);
+		if (!when || (poller_now - when) >= 15) {
+			g_hash_table_insert(__log_limiter, g_string_chunk_insert(__log_limiter_strings,
+						msg), (void *) poller_now);
+			__log_limiter_count++;
+			when = 0;
+		}
+
+		mutex_unlock(&__log_limiter_lock);
+
+		if (when)
+			goto out;
+	}
+
+	piece = msg;
+
+	while (ret > MAX_LOG_LINE_LENGTH) {
+		write_log(xprio, "%s%s%.*s ...", prefix, infix, MAX_LOG_LINE_LENGTH, piece);
+		ret -= MAX_LOG_LINE_LENGTH;
+		piece += MAX_LOG_LINE_LENGTH;
+		infix = "... ";
+	}
+
+	write_log(xprio, "%s%s%s", prefix, infix, piece);
+
+out:
 	free(msg);
 }
 
 
+void log_init() {
+	mutex_init(&__log_limiter_lock);
+	__log_limiter = g_hash_table_new(g_str_hash, g_str_equal);
+	__log_limiter_strings = g_string_chunk_new(1024);
+}

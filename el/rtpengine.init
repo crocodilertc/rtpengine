@@ -13,7 +13,7 @@
 # Provides: rtpengine
 # Required-Start: $local_fs $network
 # Short-Description: NGCP rtpengine
-# Description: NGCP rtpengine
+# Description: NGCP rtpengine 
 ### END INIT INFO
 
 # Source function library.
@@ -23,7 +23,7 @@ if [ -f /etc/sysconfig/rtpengine ]
 then
         . /etc/sysconfig/rtpengine
 else
-	echo "Error: /etc/sysconfig/rtpengine not present"
+	echo "Error: /etc/sysconfig/mediproxy-ng not present"
 	exit -1
 fi
 
@@ -58,23 +58,23 @@ build_opts() {
 
 	if [[ -n "$RTP_IP" ]]
 	then
-		OPTS+=" --ip=$RTP_IP"
+		OPTS+=" --interface=$RTP_IP"
 	fi
 
 	if [[ -n "$RTP_ADV_IP" ]]
 	then
-		OPTS+=" --advertised-ip=$RTP_ADV_IP"
+		OPTS+="!$RTP_ADV_IP"
 	fi
 
 	if [[ -n "$RTP_IP6" ]]
 	then
-		OPTS+=" --ip6=$RTP_IP6"
+		OPTS+=" --interface=$RTP_IP6"
 		IP6=1
 	fi
 
 	if [[ -n "$RTP_ADV_IP6" ]]
 	then
-		OPTS+=" --advertised-ip6=$RTP_ADV_IP6"
+		OPTS+="!$RTP_ADV_IP6"
 	fi
 
 	if [[ -n "$LISTEN_TCP" ]]
@@ -136,6 +136,11 @@ build_opts() {
 	then
 		OPTS+=" --log-level=$LOG_LEVEL"
 	fi
+
+	if [[ -n "$LOG_FACILITY" ]]
+        then
+                OPTS+=" --log-facility=$LOG_FACILITY"
+        fi
 }
 
 start() {
